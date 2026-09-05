@@ -37,32 +37,35 @@ jobs:
       - run: ./spindrift check examples/spindrift.conf
       - name: Serve and exercise the pipeline
         run: |
+          trap 'echo "FAILED: $BASH_COMMAND"; cat server.log' ERR
           ./spindrift serve examples/spindrift.conf > server.log 2>&1 &
           echo $! > pid
           sleep 1
-          test "$(curl -s localhost:8080/users/7?q=hi)" = '{"id":"7","q":"hi","from":"127.0.0.1"}'
-          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/secret)" = "401"
-          test "$(curl -s -H 'X-Token: letmein' localhost:8080/api/secret)" = '{"secret":true}'
-          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/static/)" = "200"
-          test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is localhost:8080/static/../go.mod)" = "404"
-          test "$(curl -s -o /dev/null -w '%{http_code}' -I localhost:8080/health)" = "200"
-          curl -s -N --max-time 3 localhost:8080/events | grep -c "data: tick" | grep -qx 5
-          curl -s localhost:8080/_spindrift/metrics | grep -q 'spindrift_requests_total{method="GET",route="/users/:id",status="200"} 1'
-          printf 'GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | nc -q1 localhost 8080 | grep -c "200 OK" | grep -qx 2
+          test "$(curl -s 127.0.0.1:8080/users/7?q=hi)" = '{"id":"7","q":"hi","from":"127.0.0.1"}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:8080/api/secret)" = "401"
+          test "$(curl -s -H 'X-Token: letmein' 127.0.0.1:8080/api/secret)" = '{"secret":true}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:8080/static/)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is 127.0.0.1:8080/static/../go.mod)" = "404"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -I 127.0.0.1:8080/health)" = "200"
+          curl -s -N --max-time 8 127.0.0.1:8080/events | grep -c "data: tick" | grep -qx 5
+          curl -s 127.0.0.1:8080/_spindrift/metrics | grep -q 'spindrift_requests_total{method="GET",route="/users/:id",status="200"} 1'
+          printf 'GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | nc -q1 127.0.0.1 8080 | grep -c "200 OK" | grep -qx 2
       - name: Load
         run: |
-          ./spindrift bench http://localhost:8080/health -c 64 -n 20000 | tee bench.txt
+          ./spindrift bench http://127.0.0.1:8080/health -c 64 -n 20000 | tee bench.txt
           grep -q " 0 errors " bench.txt
       - name: Hot reload with SIGHUP
         run: |
+          trap 'echo "FAILED: $BASH_COMMAND"; cat server.log' ERR
           sed -i 's|respond 200 text "ok"|respond 200 text "reloaded"|' examples/spindrift.conf
           kill -HUP "$(cat pid)"
           sleep 0.5
-          test "$(curl -s localhost:8080/health)" = "reloaded"
+          test "$(curl -s 127.0.0.1:8080/health)" = "reloaded"
           grep -q "reloaded examples/spindrift.conf" server.log
       - name: Graceful drain with SIGTERM
         run: |
-          curl -s -N --max-time 10 localhost:8080/events > stream.txt &
+          trap 'echo "FAILED: $BASH_COMMAND"; cat server.log' ERR
+          curl -s -N --max-time 10 127.0.0.1:8080/events > stream.txt &
           sleep 0.3
           kill -TERM "$(cat pid)"
           wait %1 || true

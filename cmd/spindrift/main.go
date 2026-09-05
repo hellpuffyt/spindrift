@@ -77,6 +77,9 @@ func serve(path string) {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	// Serve returns as soon as the listener closes; the drain runs in the
+	// signal goroutine, so main must wait for it instead of exiting.
+	drained := make(chan int, 1)
 	go func() {
 		for sig := range sigs {
 			if sig == syscall.SIGHUP {
@@ -95,15 +98,19 @@ func serve(path string) {
 			cancel()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "shutdown: %v\n", err)
-				os.Exit(1)
+				drained <- 1
+				return
 			}
-			os.Exit(0)
+			fmt.Fprintln(os.Stderr, "drained; bye")
+			drained <- 0
+			return
 		}
 	}()
 	if err := s.Serve(ln); err != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 		os.Exit(1)
 	}
+	os.Exit(<-drained)
 }
 
 func bench(url string, args []string) {

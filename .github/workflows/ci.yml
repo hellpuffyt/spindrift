@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  real-execution:
+    name: serve, curl, bench, reload, drain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go build -o spindrift ./cmd/spindrift
+      - run: ./spindrift check examples/spindrift.conf
+      - name: Serve and exercise the pipeline
+        run: |
+          ./spindrift serve examples/spindrift.conf > server.log 2>&1 &
+          echo $! > pid
+          sleep 1
+          test "$(curl -s localhost:8080/users/7?q=hi)" = '{"id":"7","q":"hi","from":"127.0.0.1"}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/secret)" = "401"
+          test "$(curl -s -H 'X-Token: letmein' localhost:8080/api/secret)" = '{"secret":true}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/static/)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is localhost:8080/static/../go.mod)" = "404"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -I localhost:8080/health)" = "200"
+          curl -s -N --max-time 3 localhost:8080/events | grep -c "data: tick" | grep -qx 5
+          curl -s localhost:8080/_spindrift/metrics | grep -q 'spindrift_requests_total{method="GET",route="/users/:id",status="200"} 1'
+          printf 'GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | nc -q1 localhost 8080 | grep -c "200 OK" | grep -qx 2
+      - name: Load
+        run: |
+          ./spindrift bench http://localhost:8080/health -c 64 -n 20000 | tee bench.txt
+          grep -q " 0 errors " bench.txt
+      - name: Hot reload with SIGHUP
+        run: |
+          sed -i 's|respond 200 text "ok"|respond 200 text "reloaded"|' examples/spindrift.conf
+          kill -HUP "$(cat pid)"
+          sleep 0.5
+          test "$(curl -s localhost:8080/health)" = "reloaded"
+          grep -q "reloaded examples/spindrift.conf" server.log
+      - name: Graceful drain with SIGTERM
+        run: |
+          curl -s -N --max-time 10 localhost:8080/events > stream.txt &
+          sleep 0.3
+          kill -TERM "$(cat pid)"
+          wait %1 || true
+          grep -c "data: tick" stream.txt | grep -qx 5
+          ! kill -0 "$(cat pid)" 2>/dev/null
+          grep -q draining server.log
+
+  lint:
+    name: fmt, vet, deps, secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: stdlib only, no unsafe, no net/http server
+        run: |
+          ! grep -q "^require" go.mod
+          ! grep -rn '"unsafe"' --include=*.go .
+          ! grep -rn "http.ListenAndServe\|http.Serve(" --include=*.go . | grep -v _test.go
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -5,7 +5,7 @@
 //	max_body 8MB
 //
 //	middleware * /*         -> header "Server" "Spindrift"
-//	middleware * /api/*     -> require header.X-Token == env.API_TOKEN else 401
+//	middleware * /api/*     -> require header.X-Token exists && header.X-Token == env.API_TOKEN else 401
 //	middleware * /api/*     -> ratelimit 50/s burst 100
 //	route GET /health       -> respond 200 text "ok"
 //	route GET /users/:id    -> respond 200 json "{\"id\":\"{{param.id}}\"}"
@@ -121,6 +121,29 @@ func parseOperand(tok string) (Operand, error) {
 		}
 	}
 	return Operand{}, fmt.Errorf("unknown operand %q (want a \"string\", method, path, remote, now, header.X, query.k, param.k or env.K)", tok)
+}
+
+// RequireEnv lists the environment variables that `require` conditions
+// read, in rule order without duplicates. An unset variable evaluates to
+// "", so `header.X == env.UNSET` passes for a request without the header;
+// the CLI warns about these at startup.
+func (c *Config) RequireEnv() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range c.Rules {
+		if r.Action.Name != "require" || r.Action.Cond == nil {
+			continue
+		}
+		for _, t := range r.Action.Cond.Terms {
+			for _, o := range []Operand{t.Left, t.Right} {
+				if o.Field == "env" && !seen[o.Key] {
+					seen[o.Key] = true
+					out = append(out, o.Key)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // Cond is `a OP b` terms joined by && / || (left to right, no parentheses).
@@ -281,7 +304,7 @@ func (e *ParseError) Error() string { return fmt.Sprintf("line %d: %s", e.Line, 
 
 // Parse parses a config document.
 func Parse(src string) (*Config, error) {
-	cfg := &Config{Listen: ":8080", Log: "json", MaxBody: 8 << 20, MaxHeader: 64 << 10, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	cfg := &Config{Listen: "127.0.0.1:8080", Log: "json", MaxBody: 8 << 20, MaxHeader: 64 << 10, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	for i, raw := range strings.Split(src, "\n") {
 		ln := i + 1
 		line := strings.TrimSpace(stripComment(raw))

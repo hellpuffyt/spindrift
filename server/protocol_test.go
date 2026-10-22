@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hellpuffyt/spindrift/config"
 )
 
 const smuggleCfg = `
@@ -156,5 +160,30 @@ func TestProxyForwardsRoutedPathAndStripsConnectionListedHeaders(t *testing.T) {
 	rawRequest(t, u, "GET /api/a%20b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 	if gotURI != "/api/a%20b" {
 		t.Fatalf("escaping lost: upstream saw %q", gotURI)
+	}
+}
+
+// With the token variable unset, the README's gate must still refuse a
+// request that sends no token. The bare `==` form documented before the
+// audit let it through ("" == "").
+func TestDocumentedTokenGateFailsClosedWhenEnvUnset(t *testing.T) {
+	cfg, err := config.Parse("log off\nmiddleware * /api/* -> require header.X-Token exists && header.X-Token == env.API_TOKEN else 401\nroute GET /api/x -> respond 200 text \"in\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, io.Discard)
+	s.Getenv = func(string) string { return "" }
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Serve(ln)
+	defer s.Shutdown(context.Background())
+	u := "http://" + ln.Addr().String()
+	if raw := rawRequest(t, u, "GET /api/x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); !strings.HasPrefix(raw, "HTTP/1.1 401") {
+		t.Fatalf("gate open with unset env and no header: %q", raw)
+	}
+	if raw := rawRequest(t, u, "GET /api/x HTTP/1.1\r\nHost: x\r\nX-Token: \r\nConnection: close\r\n\r\n"); !strings.HasPrefix(raw, "HTTP/1.1 401") {
+		t.Fatalf("gate open with unset env and empty header: %q", raw)
 	}
 }

@@ -146,3 +146,29 @@ func TestTokenizerEscapes(t *testing.T) {
 		t.Fatal("comment stripping inside quotes")
 	}
 }
+
+// Without a listen directive the server must not expose itself on every
+// interface.
+func TestDefaultListenIsLoopback(t *testing.T) {
+	cfg, err := Parse("route GET / -> respond 200 text \"x\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1:8080" {
+		t.Fatalf("default listen %q, want 127.0.0.1:8080", cfg.Listen)
+	}
+}
+
+func TestRequireEnvListsGateVariables(t *testing.T) {
+	cfg, err := Parse(`middleware * /api/* -> require header.X-Token exists && header.X-Token == env.API_TOKEN else 401
+middleware * /b/* -> require env.OTHER == header.Y || header.Z == env.API_TOKEN else 403
+route GET / -> respond 200 text "{{env.NOT_A_GATE}}"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(cfg.RequireEnv(), ",")
+	if got != "API_TOKEN,OTHER" {
+		t.Fatalf("RequireEnv = %q", got)
+	}
+}

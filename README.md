@@ -15,7 +15,7 @@ listen :8080
 log json
 
 middleware * /*        -> header "Server" "Spindrift"
-middleware * /api/*    -> require header.X-Token == env.API_TOKEN else 401
+middleware * /api/*    -> require header.X-Token exists && header.X-Token == env.API_TOKEN else 401
 middleware * /api/*    -> ratelimit 20/s burst 40
 route GET /health      -> respond 200 text "ok"
 route GET /users/:id   -> respond 200 json "{\"id\":\"{{param.id}}\",\"q\":\"{{query.q}}\"}"
@@ -75,7 +75,7 @@ strict enough to trust.
   closed immediately, active responses (even long streams) finish, then the
   process exits. Tested with a stream in flight.
 - **Conditions and templates see the request and the environment**, so
-  `require header.X-Token == env.API_TOKEN else 401` is one line and secrets
+  `require header.X-Token exists && header.X-Token == env.API_TOKEN else 401` is one line and secrets
   never live in the config file.
 - **Built-in observability**: request counters and latency histograms per
   route in Prometheus text format, structured JSON logs.

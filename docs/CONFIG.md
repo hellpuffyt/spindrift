@@ -8,7 +8,7 @@ double-quoted with `\"`, `\\`, `\n`, `\t` escapes. Sizes accept `KB`, `MB`,
 
 | Directive | Default | Meaning |
 |---|---|---|
-| `listen ADDR` | `:8080` | TCP address |
+| `listen ADDR` | `127.0.0.1:8080` | TCP address; the default is loopback-only, write `listen :8080` to accept connections from other hosts |
 | `log json\|text\|off` | `json` | access log format on stdout |
 | `max_header SIZE` | `64KB` | request line + headers budget → 431 |
 | `max_body SIZE` | `8MB` | body limit (declared or decoded) → 413 |

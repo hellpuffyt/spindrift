@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path"
@@ -222,10 +223,13 @@ func (s *Server) serveConn(conn net.Conn, st *connState) {
 		if err := rw.Finish(); err != nil {
 			return
 		}
-		s.Metrics.observe(req.Method, routeName, rw.Status(), time.Since(start))
+		s.Metrics.observe(methodLabel(req.Method), routeName, rw.Status(), time.Since(start))
 		s.logRequest(c.cfg, req, rw, routeName, time.Since(start))
 		// Drain what the handler didn't read so the next request parses.
-		if n, _ := io.CopyN(io.Discard, req.Body, 1<<20); n == 1<<20 {
+		// If the body's framing was broken or over the limit (here or while
+		// the handler read it), the stream position is unknown: close
+		// rather than parse body bytes as the next request.
+		if n, err := io.CopyN(io.Discard, req.Body, 1<<20); n == 1<<20 || (err != nil && err != io.EOF) {
 			return
 		}
 		if req.Close || rw.CloseAfter() {
@@ -260,11 +264,22 @@ func (s *Server) writeError(bw *bufio.Writer, err error) {
 	s.Metrics.observe("-", "-", status, 0)
 }
 
+// methodLabel bounds the metrics method label: methods are client-chosen
+// tokens, so anything outside the standard set is counted as OTHER.
+func methodLabel(m string) string {
+	switch m {
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE":
+		return m
+	}
+	return "OTHER"
+}
+
 // --------------------------------------------------------------- router --
 
 type match struct {
 	params map[string]string
 	rest   string
+	path   string // the cleaned, unescaped path the rule matched
 }
 
 func (r *rule) match(method, p string) (match, bool) {
@@ -352,6 +367,7 @@ func (s *Server) dispatch(c *compiled, req *http1.Request, rw *http1.ResponseWri
 		if !ok {
 			continue
 		}
+		m.path = p
 		e := s.env(req, m.params)
 		if r.Middleware {
 			if !s.middleware(r, e, req, rw) {
@@ -423,7 +439,7 @@ func (s *Server) route(r *rule, m match, e *config.Env, req *http1.Request, rw *
 	case "files":
 		s.files(a.Args[0], m.rest, req, rw)
 	case "proxy":
-		s.proxy(a.Args[0], req, rw)
+		s.proxy(a.Args[0], m.path, req, rw)
 	case "stream":
 		s.stream(a, e, rw)
 	}
@@ -461,7 +477,13 @@ func (s *Server) files(root, rest string, req *http1.Request, rw *http1.Response
 	}
 	st, err := os.Stat(real)
 	if err == nil && st.IsDir() {
-		real = filepath.Join(real, "index.html")
+		// index.html may itself be a symlink: resolve and re-check
+		// containment before serving it.
+		real, err = filepath.EvalSymlinks(filepath.Join(real, "index.html"))
+		if err != nil || (real != realRoot && !strings.HasPrefix(real, realRoot+string(filepath.Separator))) {
+			rw.Respond(404, "text/plain; charset=utf-8", []byte("Not Found\n"))
+			return
+		}
 		st, err = os.Stat(real)
 	}
 	if err != nil || !st.Mode().IsRegular() {
@@ -498,8 +520,15 @@ func (s *Server) files(root, rest string, req *http1.Request, rw *http1.Response
 
 var hopByHop = []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
 
-func (s *Server) proxy(upstream string, req *http1.Request, rw *http1.ResponseWriter) {
-	target := strings.TrimSuffix(upstream, "/") + req.Path
+// proxy forwards the request. The upstream gets the cleaned path that the
+// router matched and middleware authorised, re-escaped, not the raw
+// request-target: otherwise `/api/public/../admin` style paths would be
+// checked as one path and served as another.
+func (s *Server) proxy(upstream, routed string, req *http1.Request, rw *http1.ResponseWriter) {
+	if strings.HasSuffix(req.Path, "/") && !strings.HasSuffix(routed, "/") {
+		routed += "/" // path.Clean drops it; the upstream may care
+	}
+	target := strings.TrimSuffix(upstream, "/") + (&url.URL{Path: routed}).EscapedPath()
 	if req.RawQuery != "" {
 		target += "?" + req.RawQuery
 	}
@@ -515,8 +544,9 @@ func (s *Server) proxy(upstream string, req *http1.Request, rw *http1.ResponseWr
 	if req.ContentLength > 0 {
 		out.ContentLength = req.ContentLength
 	}
+	connListed := connectionTokens(req.Header)
 	for k, vs := range req.Header {
-		if isHop(k) || k == "Host" {
+		if isHop(k) || k == "Host" || connListed[k] {
 			continue
 		}
 		out.Header[k] = append([]string(nil), vs...)
@@ -530,8 +560,9 @@ func (s *Server) proxy(upstream string, req *http1.Request, rw *http1.ResponseWr
 		return
 	}
 	defer resp.Body.Close()
+	respListed := connectionTokens(http1.Header(resp.Header))
 	for k, vs := range resp.Header {
-		if isHop(k) {
+		if isHop(k) || respListed[k] {
 			continue
 		}
 		for _, v := range vs {
@@ -556,6 +587,20 @@ func (s *Server) proxy(upstream string, req *http1.Request, rw *http1.ResponseWr
 			return
 		}
 	}
+}
+
+// connectionTokens returns the canonical names listed in Connection; they
+// are hop-by-hop for this message (RFC 9110 §7.6.1).
+func connectionTokens(h http1.Header) map[string]bool {
+	out := map[string]bool{}
+	for _, v := range h["Connection"] {
+		for _, tok := range strings.Split(v, ",") {
+			if tok = strings.TrimSpace(tok); tok != "" {
+				out[textproto.CanonicalMIMEHeaderKey(tok)] = true
+			}
+		}
+	}
+	return out
 }
 
 func isHop(k string) bool {

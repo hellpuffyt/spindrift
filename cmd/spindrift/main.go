@@ -38,6 +38,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("listen %s  log %s  max_body %d  max_header %d\n", cfg.Listen, cfg.Log, cfg.MaxBody, cfg.MaxHeader)
+		warnEmptyEnv(cfg)
 		for _, r := range cfg.Rules {
 			kind := "route     "
 			if r.Middleware {
@@ -56,6 +57,17 @@ func main() {
 	}
 }
 
+// warnEmptyEnv flags `require` conditions that read an unset or empty
+// environment variable: compared with an absent header they are equal, so
+// the gate would open for everyone.
+func warnEmptyEnv(cfg *config.Config) {
+	for _, k := range cfg.RequireEnv() {
+		if os.Getenv(k) == "" {
+			fmt.Fprintf(os.Stderr, "warning: env.%s is empty or unset but a require condition reads it; a bare `header.X == env.%s` passes requests that omit the header (guard it with `header.X exists &&`)\n", k, k)
+		}
+	}
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: spindrift serve CONFIG | check CONFIG | bench URL [-c N] [-n N]")
 	os.Exit(2)
@@ -67,6 +79,7 @@ func serve(path string) {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
 		os.Exit(1)
 	}
+	warnEmptyEnv(cfg)
 	s := server.New(cfg, os.Stdout)
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

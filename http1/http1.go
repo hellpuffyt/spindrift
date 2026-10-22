@@ -77,7 +77,12 @@ type Request struct {
 	Major    int
 	Minor    int
 	Header   Header
-	Body     io.Reader
+	// Trailer receives the trailer fields of a chunked body once Body has
+	// been read to EOF. Trailers are never merged into Header
+	// (RFC 9110 §6.5.1): a trailer must not be able to pose as a header
+	// that was already checked.
+	Trailer Header
+	Body    io.Reader
 	// ContentLength is -1 for chunked bodies.
 	ContentLength int64
 	// Close reports whether the connection must close after the response
@@ -97,6 +102,11 @@ func ReadRequest(br *bufio.Reader, lim Limits) (*Request, error) {
 	budget := lim.MaxHeaderBytes
 
 	line, err := readLine(br, &budget)
+	// RFC 9112 §2.2: ignore empty lines received before the request-line
+	// (still charged to the header budget).
+	for err == nil && line == "" {
+		line, err = readLine(br, &budget)
+	}
 	if err != nil {
 		if errors.Is(err, io.EOF) && budget == lim.MaxHeaderBytes {
 			return nil, io.EOF
@@ -110,14 +120,14 @@ func ReadRequest(br *bufio.Reader, lim Limits) (*Request, error) {
 	if len(parts) != 3 {
 		return nil, ErrMalformed
 	}
-	req := &Request{Method: parts[0], Target: parts[1], Header: Header{}}
+	req := &Request{Method: parts[0], Target: parts[1], Header: Header{}, Trailer: Header{}}
 	if !validToken(req.Method) {
 		return nil, ErrMalformed
 	}
 	if len(req.Target) > lim.MaxTargetBytes {
 		return nil, ErrURITooLong
 	}
-	if req.Target == "" || strings.ContainsAny(req.Target, " \t\r\n") {
+	if req.Target == "" || hasCTLOrSpace(req.Target) {
 		return nil, ErrMalformed
 	}
 	switch parts[2] {
@@ -142,13 +152,20 @@ func ReadRequest(br *bufio.Reader, lim Limits) (*Request, error) {
 		// absolute-form: scheme://host/path?query
 		rest := req.Target[i+3:]
 		slash := strings.IndexByte(rest, '/')
+		host := rest
 		if slash < 0 {
 			req.Path = "/"
+			if q := strings.IndexByte(rest, '?'); q >= 0 {
+				host, req.RawQuery = rest[:q], rest[q+1:]
+			}
 		} else {
 			req.Path, req.RawQuery, _ = strings.Cut(rest[slash:], "?")
-			host := rest[:slash]
-			req.Header.Set("Host", host)
+			host = rest[:slash]
 		}
+		if host == "" {
+			return nil, ErrMalformed
+		}
+		req.Header.Set("Host", host)
 	} else {
 		return nil, ErrMalformed
 	}
@@ -172,13 +189,17 @@ func ReadRequest(br *bufio.Reader, lim Limits) (*Request, error) {
 			return nil, ErrMalformed
 		}
 		value = strings.Trim(value, " \t")
-		if strings.ContainsAny(value, "\x00\r\n") {
+		if !validFieldValue(value) {
 			return nil, ErrMalformed
 		}
 		req.Header.Add(name, value)
 	}
 
-	if req.Major == 1 && req.Minor == 1 && !req.Header.Has("Host") {
+	// RFC 9112 §3.2: a 1.1 request needs exactly one Host field line.
+	if req.Major == 1 && req.Minor == 1 && len(req.Header["Host"]) != 1 {
+		return nil, ErrMalformed
+	}
+	if len(req.Header["Host"]) > 1 {
 		return nil, ErrMalformed
 	}
 
@@ -189,21 +210,30 @@ func ReadRequest(br *bufio.Reader, lim Limits) (*Request, error) {
 	} else {
 		req.Close = strings.Contains(conn, "close")
 	}
-	req.Expect100 = strings.EqualFold(req.Header.Get("Expect"), "100-continue")
+	// RFC 9110 §10.1.1: an HTTP/1.0 client never gets an interim 100.
+	req.Expect100 = req.Minor >= 1 && strings.EqualFold(req.Header.Get("Expect"), "100-continue")
 
 	// Body framing (RFC 9112 §6).
 	te := req.Header["Transfer-Encoding"]
 	cls := req.Header["Content-Length"]
 	switch {
 	case len(te) > 0:
+		if req.Minor == 0 {
+			// RFC 9112 §6.1: Transfer-Encoding in HTTP/1.0 means the
+			// framing is faulty; refuse and close.
+			return nil, ErrMalformed
+		}
 		if len(te) != 1 || !strings.EqualFold(strings.TrimSpace(te[0]), "chunked") {
 			return nil, ErrMalformed // only a lone "chunked" is accepted
 		}
 		if len(cls) > 0 {
-			req.Header.Del("Content-Length") // TE wins; the request is suspicious
+			// TE wins (RFC 9112 §6.3), and the connection MUST be closed
+			// after the response (§6.1): this is the classic smuggling shape.
+			req.Header.Del("Content-Length")
+			req.Close = true
 		}
 		req.ContentLength = -1
-		req.Body = &chunkedReader{br: br, max: lim.MaxBodyBytes, trailers: req.Header}
+		req.Body = &chunkedReader{br: br, max: lim.MaxBodyBytes, trailers: req.Trailer, trailerBudget: lim.MaxHeaderBytes}
 	case len(cls) > 0:
 		n, err := parseContentLength(cls)
 		if err != nil {
@@ -246,6 +276,28 @@ func readLine(br *bufio.Reader, budget *int) (string, error) {
 		return "", ErrMalformed // bare LF
 	}
 	return string(line[:len(line)-2]), nil
+}
+
+// hasCTLOrSpace reports whether s contains whitespace, a control byte or
+// DEL; none may appear in a request-target (RFC 9112 §3.2).
+func hasCTLOrSpace(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= ' ' || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// validFieldValue rejects control characters other than HTAB, including
+// CR, LF and NUL (RFC 9110 §5.5). obs-text (0x80-0xFF) is allowed.
+func validFieldValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < ' ' && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func validToken(s string) bool {
@@ -299,16 +351,22 @@ func (l *lengthReader) Read(p []byte) (int, error) {
 }
 
 // chunkedReader decodes chunked transfer coding, enforcing the body limit
-// on decoded bytes and collecting trailers into the request header.
+// on decoded bytes and collecting trailers into a separate trailer map.
+// Chunk-size lines and the trailer section are byte-bounded and must use
+// CRLF, like the header section.
 type chunkedReader struct {
-	br       *bufio.Reader
-	max      int64
-	total    int64
-	remain   int64
-	done     bool
-	err      error
-	trailers Header
+	br            *bufio.Reader
+	max           int64
+	total         int64
+	remain        int64
+	done          bool
+	err           error
+	trailers      Header
+	trailerBudget int
 }
+
+// maxChunkLine bounds a chunk-size line including extensions.
+const maxChunkLine = 4096
 
 func (c *chunkedReader) Read(p []byte) (int, error) {
 	if c.err != nil {
@@ -318,32 +376,18 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if c.remain == 0 {
-		line, err := c.br.ReadString('\n')
+		budget := maxChunkLine
+		line, err := readLine(c.br, &budget)
 		if err != nil {
-			return 0, c.fail(io.ErrUnexpectedEOF)
+			return 0, c.fail(bodyErr(err))
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if ext := strings.IndexByte(line, ';'); ext >= 0 {
-			line = line[:ext] // chunk extensions are ignored
-		}
-		size, err := strconv.ParseInt(strings.TrimSpace(line), 16, 64)
-		if err != nil || size < 0 {
+		size, ok := parseChunkSize(line)
+		if !ok {
 			return 0, c.fail(ErrMalformed)
 		}
 		if size == 0 {
-			// trailers until an empty line
-			for {
-				t, err := c.br.ReadString('\n')
-				if err != nil {
-					return 0, c.fail(io.ErrUnexpectedEOF)
-				}
-				t = strings.TrimRight(t, "\r\n")
-				if t == "" {
-					break
-				}
-				if name, value, ok := strings.Cut(t, ":"); ok && validToken(name) {
-					c.trailers.Add(name, strings.TrimSpace(value))
-				}
+			if err := c.readTrailers(); err != nil {
+				return 0, c.fail(err)
 			}
 			c.done = true
 			return 0, io.EOF
@@ -369,6 +413,76 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// readTrailers reads the trailer section after the last chunk with the
+// same rules as the header section: CRLF only, no obs-fold, valid names
+// and values, bounded size.
+func (c *chunkedReader) readTrailers() error {
+	budget := c.trailerBudget
+	for {
+		t, err := readLine(c.br, &budget)
+		if err != nil {
+			return bodyErr(err)
+		}
+		if t == "" {
+			return nil
+		}
+		if t[0] == ' ' || t[0] == '\t' {
+			return ErrMalformed
+		}
+		name, value, ok := strings.Cut(t, ":")
+		value = strings.Trim(value, " \t")
+		if !ok || !validToken(name) || !validFieldValue(value) {
+			return ErrMalformed
+		}
+		c.trailers.Add(name, value)
+	}
+}
+
+// bodyErr maps a line-read failure inside a body to the error a body
+// reader reports: a short read is an unexpected EOF, an oversized line is
+// malformed framing.
+func bodyErr(err error) error {
+	switch {
+	case errors.Is(err, io.EOF):
+		return io.ErrUnexpectedEOF
+	case errors.Is(err, ErrHeaderTooLarge):
+		return ErrMalformed
+	}
+	return err
+}
+
+// parseChunkSize parses `chunk-size [ BWS ";" chunk-ext ]` (RFC 9112 §7.1):
+// one or more hex digits, nothing else before the extension, no sign, no
+// prefix, no leading whitespace, and a value that fits in an int64.
+func parseChunkSize(line string) (int64, bool) {
+	if i := strings.IndexByte(line, ';'); i >= 0 {
+		line = strings.TrimRight(line[:i], " \t") // BWS before the extension
+	}
+	if line == "" || len(line) > 16 {
+		return 0, false
+	}
+	var n uint64
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		n = n<<4 | uint64(d)
+	}
+	if n > 1<<62 {
+		return 0, false
+	}
+	return int64(n), true
 }
 
 func (c *chunkedReader) fail(err error) error { c.err = err; return err }
@@ -445,10 +559,16 @@ func (rw *ResponseWriter) WriteHeader(status int) {
 	}
 	fmt.Fprintf(rw.w, "HTTP/1.1 %d %s\r\n", status, StatusText(status))
 	for k, vs := range h {
+		if !validToken(k) {
+			continue // a name that is not a token cannot be sent safely
+		}
 		for _, v := range vs {
 			rw.w.WriteString(k)
 			rw.w.WriteString(": ")
-			rw.w.WriteString(v)
+			// Values may carry request data via templates; CR, LF and NUL
+			// become spaces so they cannot start a new header line or end
+			// the header section (response splitting).
+			rw.w.WriteString(headerValueReplacer.Replace(v))
 			rw.w.WriteString("\r\n")
 		}
 	}
@@ -541,5 +661,7 @@ var statusText = map[int]string{
 	415: "Unsupported Media Type", 417: "Expectation Failed", 422: "Unprocessable Content", 429: "Too Many Requests", 431: "Request Header Fields Too Large",
 	500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout", 505: "HTTP Version Not Supported",
 }
+
+var headerValueReplacer = strings.NewReplacer("\r", " ", "\n", " ", "\x00", " ")
 
 func nowHTTP() string { return time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT") }

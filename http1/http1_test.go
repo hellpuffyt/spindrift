@@ -72,8 +72,12 @@ func TestChunkedBodyWithTrailersAndExtensions(t *testing.T) {
 	if got := body(t, req.Body); got != "Wikipedia in\r\n\r\nchunks." {
 		t.Fatalf("body %q", got)
 	}
-	if req.Header.Get("X-Checksum") != "abc" {
-		t.Fatalf("trailer not merged: %v", req.Header)
+	// Expectation changed in the audit: trailers used to be merged into
+	// Header. RFC 9110 §6.5.1 forbids merging unless the field allows it, and
+	// merging let a trailer pose as an already-checked header, so they now
+	// live in req.Trailer.
+	if req.Trailer.Get("X-Checksum") != "abc" || req.Header.Has("X-Checksum") {
+		t.Fatalf("trailer: header %v trailer %v", req.Header, req.Trailer)
 	}
 	next, err := ReadRequest(br, Limits{})
 	if err != nil || next.Path != "/next" {

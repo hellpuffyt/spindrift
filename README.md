@@ -145,9 +145,11 @@ test runs 32 keep-alive clients × 200 requests and asserts zero failures
 
 ## Benchmarks
 
-`spindrift bench URL -c 64 -n 50000` against `examples/spindrift.conf` with
-`log off`, loopback, Apple M5 (10 cores, 16 GB), macOS 27.0.1, Go 1.27.3, on
-an otherwise quiet machine. Three runs per route; the median run is shown:
+Measured on 2026-10-22 at commit `ab6087a` (recorded in
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)) and not
+reproduced for this README refresh: `spindrift bench URL -c 64 -n 50000`
+against `examples/spindrift.conf` with `log off`, loopback, Apple M5 (10 cores,
+16 GB), macOS 27.0.1, Go 1.27.3. Three runs per route; the median run is shown:
 
 | Route | Throughput | p50 | p99 |
 |---|---|---|---|

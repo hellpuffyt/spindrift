@@ -1,14 +1,23 @@
 # Spindrift
 
-**A programmable HTTP/1.1 server with its own protocol stack, a pipeline
-language instead of a config file, and reloads that never drop a request.**
+A programmable HTTP/1.1 server with its own protocol stack, a small pipeline
+language instead of a config file, and hot reloads that let in-flight requests
+finish on the old pipeline.
 
-Spindrift is ~2,250 lines of Go (excluding tests) with no dependencies outside the standard
-library — and it does not use `net/http` on the server side. Requests are
-parsed by Spindrift's own strict RFC 9112 implementation, then flow through
-a pipeline you write in a small declarative language: middleware, routing,
-static files, reverse proxy, streaming, rate limits, conditions and
-templates.
+[Case study ↗](https://hellpuff.dev/work/spindrift)
+
+Spindrift is about 2,250 lines of Go (excluding tests) with no dependencies
+outside the standard library, and it does not use `net/http` on the server
+side. Requests are parsed by Spindrift's own strict RFC 9112 implementation,
+then flow through a pipeline you write in a small declarative language:
+middleware, routing, static files, reverse proxy, streaming, rate limits,
+conditions and templates.
+
+**Status:** unreleased (no tagged version yet). HTTP/1.1 only, no TLS; see
+Limitations and [`ROADMAP.md`](ROADMAP.md).
+
+A pipeline file looks like this (it passes `spindrift check`, which warns if
+`API_TOKEN` is unset):
 
 ```
 listen :8080
@@ -24,17 +33,70 @@ route * /static/*      -> files "./public"
 route * /api/*         -> proxy "http://127.0.0.1:9000"
 ```
 
-```
-$ spindrift serve examples/spindrift.conf
-spindrift listening on [::]:8080 (14 rules) — SIGHUP reloads, SIGINT drains
-$ curl -s localhost:8080/users/7?q=hi
+## Demo
+
+Real terminal captures from a clone on macOS, Go 1.27.3, with
+`./spindrift serve examples/spindrift.conf` running in another terminal. It
+prints `spindrift listening on [::]:8080 (14 rules) — SIGHUP reloads, SIGINT drains`
+on start, and access logs as JSON lines.
+
+<img src="docs/screenshots/serve-example-client-session.png" width="100%" alt="Terminal capture of curl requests against the example pipeline: a templated JSON response for /users/7, 401 without the X-Token header and 200 with it, a 301 redirect, 404 for an encoded path traversal under /static, five server-sent event ticks from /events, and per-route Prometheus request counters.">
+
+```console
+$ curl -s 'localhost:8080/users/7?q=hi'; echo
 {"id":"7","q":"hi","from":"::1"}
-$ spindrift bench http://127.0.0.1:8080/health -c 64 -n 50000
-50000 requests, 64 connections, 0 errors in 0.61s
-82124 req/s   p50 552.708µs   p90 1.711917ms   p99 3.502583ms   max 10.379084ms
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/api/secret
+401
+$ curl -s -H 'X-Token: letmein' localhost:8080/api/secret; echo
+{"secret":true}
+$ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' localhost:8080/old
+301 http://localhost:8080/health
+$ curl -s --path-as-is -o /dev/null -w '%{http_code}\n' 'localhost:8080/static/%2e%2e/%2e%2e/go.mod'
+404
+$ curl -sN localhost:8080/events
+data: tick 1792999290
+
+data: tick 1792999291
+
+data: tick 1792999291
+
+data: tick 1792999292
+
+data: tick 1792999292
+
+$ curl -s localhost:8080/_spindrift/metrics | grep '^spindrift_requests_total' | grep -v 'route="-"'
+spindrift_requests_total{method="GET",route="/api/*",status="401"} 1
+spindrift_requests_total{method="GET",route="/api/secret",status="200"} 1
+spindrift_requests_total{method="GET",route="/events",status="200"} 1
+spindrift_requests_total{method="GET",route="/old",status="301"} 1
+spindrift_requests_total{method="GET",route="/users/:id",status="200"} 1
 ```
 
-## What is it?
+<img src="docs/screenshots/check-example-pipeline.png" width="100%" alt="Terminal capture of spindrift check examples/spindrift.conf listing the global settings and each middleware and route rule with its source line number and action.">
+
+`spindrift check` parses a pipeline without serving it and lists each rule
+with its line number:
+
+```console
+$ ./spindrift check examples/spindrift.conf
+listen :8080  log json  max_body 4194304  max_header 65536
+ 15  middleware *              /*                       -> header
+ 16  middleware *              /*                       -> cors
+ 17  middleware *              /api/*                   -> require
+ 18  middleware *              /api/*                   -> ratelimit
+ 19  middleware *              /admin/*                 -> require
+ 22  route      [GET]          /                        -> respond
+ 23  route      [GET HEAD]     /health                  -> respond
+ 24  route      [GET]          /users/:id               -> respond
+ 25  route      [GET]          /api/secret              -> respond
+ 26  route      [GET]          /admin/status            -> respond
+ 27  route      [GET]          /events                  -> stream
+ 28  route      [GET]          /old                     -> redirect
+ 29  route      *              /static/*                -> files
+ 30  route      *              /upstream/*              -> proxy
+```
+
+## What it owns
 
 | Layer | What Spindrift owns |
 |---|---|
@@ -42,28 +104,18 @@ $ spindrift bench http://127.0.0.1:8080/health -c 64 -n 50000
 | **Pipeline language** (`config/`) | `route` / `middleware` rules, `:param` and trailing `/*` patterns, conditions (`==`, `!=`, `contains`, `startswith`, `endswith`, `matches`, `exists`, `&&`, `||`) over request fields and environment, `{{…}}` templates, sizes and durations. Errors carry line numbers. |
 | **Engine** (`server/`) | Per-connection goroutines with an idle timeout that also bounds the header read (slowloris → 408) and a body read timeout; connections close whenever body framing breaks; the router; handlers `respond`, `redirect`, `files` (traversal- and symlink-safe, `If-Modified-Since`), `proxy` (streaming both ways, hop-by-hop stripping, `X-Forwarded-*`), `stream` (chunked SSE); middleware `header`, `require`, `ratelimit` (token bucket per client), `cors`; Prometheus metrics at `/_spindrift/metrics`; JSON or text access logs; atomic hot reload on `SIGHUP`; graceful drain on `SIGINT`/`SIGTERM`. |
 
-## Who is it for?
-
-- Developers who want a **front door they can read**: one binary, one text
-  file, every behaviour visible in the pipeline.
-- Teams running **internal APIs, static sites, and small reverse proxies**
-  who need auth gates, rate limits and observability without a control plane.
-- Anyone who wants to **see how an HTTP server actually works** without
-  reading a hundred thousand lines of nginx.
-
-## Why does it exist?
+## Why
 
 Most servers are configured; Spindrift is *programmed*. nginx and Caddy are
 excellent, and both hide the request pipeline behind a large configuration
 surface and a larger code base. Frameworks give you a pipeline but tie it to
 a language runtime and a rebuild per change. Spindrift's bet is that a small
-pipeline language with conditions and templates covers the everyday cases —
-route, gate, limit, template, serve, proxy, stream — and that editing a text
+pipeline language with conditions and templates covers the everyday cases
+(route, gate, limit, template, serve, proxy, stream), and that editing a text
 file and sending `SIGHUP` is the right deployment model for it. Owning the
-HTTP/1.1 layer is what makes the whole thing small enough to audit and
-strict enough to trust.
+HTTP/1.1 layer keeps the whole thing small enough to read end to end.
 
-## What makes it different?
+## Design choices
 
 - **No `net/http` on the hot path.** The parser has byte budgets for headers
   and bodies, exact framing rules, and protocol tests for pipelining, chunked
@@ -73,7 +125,7 @@ strict enough to trust.
 - **Reloads keep the old pipeline for in-flight requests** and swap the new
   one atomically for the next request on every connection. Rate-limit
   buckets survive reloads for unchanged rules. Tested.
-- **Graceful drain that actually drains:** idle keep-alive connections are
+- **Graceful drain:** idle keep-alive connections are
   closed immediately, active responses (even long streams) finish, then the
   process exits. Tested with a stream in flight.
 - **Conditions and templates see the request and the environment**, so
@@ -82,9 +134,9 @@ strict enough to trust.
 - **Built-in observability**: request counters and latency histograms per
   route in Prometheus text format, structured JSON logs.
 
-## Why is this not just a tutorial?
+## What is tested
 
-Because the corners are handled and tested, not hand-waved: header size
+Header size
 attacks get 431, oversized bodies 413, slow clients 408, unknown percent
 escapes 400, and every path traversal form (`..`, `%2e%2e`, `..%2f`,
 symlinks out of the root) returns 404 without touching the file. The load
@@ -93,16 +145,21 @@ test runs 32 keep-alive clients × 200 requests and asserts zero failures
 
 ## Benchmarks
 
-`spindrift bench URL -c 64 -n 50000` against `examples/spindrift.conf` with
-`log off`, loopback, Apple M5 (10 cores, 16 GB), macOS 27.0.1, Go 1.27.3.
-Three runs per route; the median run is shown:
+Measured on 2026-10-22 at commit `ab6087a` (recorded in
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)) and not
+reproduced for this README refresh: `spindrift bench URL -c 64 -n 50000`
+against `examples/spindrift.conf` with `log off`, loopback, Apple M5 (10 cores,
+16 GB), macOS 27.0.1, Go 1.27.3. Three runs per route; the median run is shown:
 
 | Route | Throughput | p50 | p99 |
 |---|---|---|---|
-| `/health` — `respond 200 text "ok"` | 82.1 k req/s | 0.55 ms | 3.5 ms |
-| `/users/7?q=hi` — `respond 200 json` with 3 template holes + 2 middleware | 75.3 k req/s | 0.54 ms | 4.8 ms |
+| `/health`: `respond 200 text "ok"` | 82.1 k req/s | 0.55 ms | 3.5 ms |
+| `/users/7?q=hi`: `respond 200 json` with 3 template holes + 2 middleware | 75.3 k req/s | 0.54 ms | 4.8 ms |
 
 The generator shares the machine with the server, so this is a lower bound.
+Numbers depend heavily on machine load: a rerun on 2026-10-26 with a load
+average around 30 from other jobs gave medians of 54k req/s (`/health`) and
+49k req/s (`/users/7`).
 Requests cost one goroutine wake-up, one parse, one small allocation set;
 there is no reflection and no per-request map copy of the pipeline.
 
@@ -118,9 +175,11 @@ go test -race ./...
 kill -HUP <pid>               # reload the file; kill -INT to drain and exit
 ```
 
-Go 1.24 or newer. Docker: `docker build -t spindrift . && docker run -p 8080:8080 spindrift`.
+Go 1.24 or newer (CI builds with 1.24 on Linux, macOS and Windows). Docker:
+`docker build -t spindrift . && docker run -p 8080:8080 spindrift` builds a
+static binary into a `scratch` image that serves `examples/spindrift.conf`.
 
-## Limits (honest)
+## Limitations
 
 - HTTP/1.1 only: no TLS termination, no HTTP/2 or 3, no WebSocket upgrade.
   Put Spindrift behind a TLS terminator or wait for `ROADMAP.md`.
@@ -143,19 +202,17 @@ Go 1.24 or newer. Docker: `docker build -t spindrift . && docker run -p 8080:808
 
 ## Documentation
 
-- [`docs/CONFIG.md`](docs/CONFIG.md) — the pipeline language, every directive and action
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — connection lifecycle, router, reload, drain
-- [`SECURITY.md`](SECURITY.md) — threat model and what is tested
-- [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) — audit evidence and acceptance checklist
+- [`docs/CONFIG.md`](docs/CONFIG.md): the pipeline language, every directive and action
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): connection lifecycle, router, reload, drain
+- [`SECURITY.md`](SECURITY.md): threat model and what is tested
+- [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md): audit evidence and acceptance checklist
 - [`TESTING.md`](TESTING.md), [`ROADMAP.md`](ROADMAP.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md)
 
-## Why star or contribute?
+## Contributing
 
-Star it if you want an HTTP server whose every byte on the wire you can trace
-to a line you can read. Contribute if you want to implement TLS, HTTP/2, a
-new action, or a new condition operator — each is a contained change against
-a tested core, and the pipeline language makes new features immediately
-usable from a text file.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). TLS, HTTP/2, new actions and new
+condition operators are listed in [`ROADMAP.md`](ROADMAP.md); each is a
+contained change against the tested core.
 
 ## License
 
